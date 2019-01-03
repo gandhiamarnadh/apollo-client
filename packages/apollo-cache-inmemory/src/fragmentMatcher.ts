@@ -29,7 +29,7 @@ export class HeuristicFragmentMatcher implements FragmentMatcherInterface {
     idValue: IdValue,
     typeCondition: string,
     context: ReadStoreContext,
-  ): boolean {
+  ): boolean | 'heuristic' {
     const obj = context.store.get(idValue.id);
 
     if (!obj && idValue.id === 'ROOT_QUERY') {
@@ -63,8 +63,7 @@ export class HeuristicFragmentMatcher implements FragmentMatcherInterface {
         }
       }
 
-      context.returnPartialData = true;
-      return true;
+      return 'heuristic';
     }
 
     if (obj.__typename === typeCondition) {
@@ -81,12 +80,11 @@ export class HeuristicFragmentMatcher implements FragmentMatcherInterface {
         'queries contain union or interface types. Apollo Client will not be ' +
         'able to accurately map fragments. To make this error go away, use ' +
         'the `IntrospectionFragmentMatcher` as described in the docs: ' +
-        'https://www.apollographql.com/docs/react/recipes/fragment-matching.html',
+        'https://www.apollographql.com/docs/react/advanced/fragments.html#fragment-matcher',
       'error',
     );
 
-    context.returnPartialData = true;
-    return true;
+    return 'heuristic';
   }
 }
 

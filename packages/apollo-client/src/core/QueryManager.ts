@@ -11,7 +11,6 @@ import {
   getOperationName,
   getQueryDefinition,
   isProduction,
-  maybeDeepFreeze,
   hasDirectives,
 } from 'apollo-utilities';
 
@@ -55,16 +54,6 @@ export interface QueryInfo {
   cancel?: (() => void);
 }
 
-const defaultQueryInfo = {
-  listeners: [],
-  invalidated: false,
-  document: null,
-  newData: null,
-  lastRequestId: null,
-  observableQuery: null,
-  subscriptions: [],
-};
-
 export interface QueryPromise {
   resolve: (result: ApolloQueryResult<any>) => void;
   reject: (error: Error) => void;
@@ -79,6 +68,7 @@ export class QueryManager<TStore> {
 
   private deduplicator: ApolloLink;
   private queryDeduplication: boolean;
+  private clientAwareness: Record<string, string> = {};
 
   private onBroadcast: () => void;
 
@@ -105,19 +95,21 @@ export class QueryManager<TStore> {
     store,
     onBroadcast = () => undefined,
     ssrMode = false,
+    clientAwareness = {},
   }: {
     link: ApolloLink;
     queryDeduplication?: boolean;
     store: DataStore<TStore>;
     onBroadcast?: () => void;
     ssrMode?: boolean;
+    clientAwareness?: Record<string, string>;
   }) {
     this.link = link;
     this.deduplicator = ApolloLink.from([new Deduplicator(), link]);
     this.queryDeduplication = queryDeduplication;
     this.dataStore = store;
     this.onBroadcast = onBroadcast;
-
+    this.clientAwareness = clientAwareness;
     this.scheduler = new QueryScheduler({ queryManager: this, ssrMode });
   }
 
@@ -234,13 +226,17 @@ export class QueryManager<TStore> {
             continue;
           }
 
-          refetchQueryPromises.push(
-            this.query({
-              query: refetchQuery.query,
-              variables: refetchQuery.variables,
-              fetchPolicy: 'network-only',
-            }),
-          );
+          const queryOptions: QueryOptions = {
+            query: refetchQuery.query,
+            variables: refetchQuery.variables,
+            fetchPolicy: 'network-only',
+          };
+
+          if (refetchQuery.context) {
+            queryOptions.context = refetchQuery.context;
+          }
+
+          refetchQueryPromises.push(this.query(queryOptions));
         }
 
         if (awaitRefetchQueries) {
@@ -611,20 +607,13 @@ export class QueryManager<TStore> {
           }
 
           if (observer.next) {
-            const isDifferentResult = !(
-              lastResult &&
-              resultFromStore &&
-              lastResult.networkStatus === resultFromStore.networkStatus &&
-              lastResult.stale === resultFromStore.stale &&
-              // We can do a strict equality check here because we include a `previousResult`
-              // with `readQueryFromStore`. So if the results are the same they will be
-              // referentially equal.
-              lastResult.data === resultFromStore.data
-            );
-
-            if (isDifferentResult || previouslyHadError) {
+            if (
+              previouslyHadError ||
+              !observableQuery ||
+              observableQuery.isDifferentFromLastResult(resultFromStore)
+            ) {
               try {
-                observer.next(maybeDeepFreeze(resultFromStore));
+                observer.next(resultFromStore);
               } catch (e) {
                 // Throw error outside this control flow to avoid breaking Apollo's state
                 setTimeout(() => {
@@ -651,10 +640,10 @@ export class QueryManager<TStore> {
   // supposed to be refetched in the event of a store reset. Once we unify error handling for
   // network errors and non-network errors, the shouldSubscribe option will go away.
 
-  public watchQuery<T>(
+  public watchQuery<T, TVariables = OperationVariables>(
     options: WatchQueryOptions,
     shouldSubscribe = true,
-  ): ObservableQuery<T> {
+  ): ObservableQuery<T, TVariables> {
     if (options.fetchPolicy === 'standby') {
       throw new Error(
         'client.watchQuery cannot be called with fetchPolicy set to "standby"',
@@ -678,9 +667,9 @@ export class QueryManager<TStore> {
       options.notifyOnNetworkStatusChange = false;
     }
 
-    let transformedOptions = { ...options } as WatchQueryOptions;
+    let transformedOptions = { ...options } as WatchQueryOptions<TVariables>;
 
-    return new ObservableQuery<T>({
+    return new ObservableQuery<T, TVariables>({
       scheduler: this.scheduler,
       options: transformedOptions,
       shouldSubscribe: shouldSubscribe,
@@ -993,8 +982,8 @@ export class QueryManager<TStore> {
     const lastResult = observableQuery.getLastResult();
     const { newData } = this.getQuery(observableQuery.queryId);
     // XXX test this
-    if (newData) {
-      return maybeDeepFreeze({ data: newData.result, partial: false });
+    if (newData && newData.complete) {
+      return { data: newData.result, partial: false };
     } else {
       try {
         // the query is brand new, so we read from the store to see if anything is there
@@ -1005,9 +994,9 @@ export class QueryManager<TStore> {
           optimistic,
         });
 
-        return maybeDeepFreeze({ data, partial: false });
+        return { data, partial: false };
       } catch (e) {
-        return maybeDeepFreeze({ data: {}, partial: true });
+        return { data: {}, partial: true };
       }
     }
   }
@@ -1228,7 +1217,17 @@ export class QueryManager<TStore> {
   }
 
   private getQuery(queryId: string) {
-    return this.queries.get(queryId) || { ...defaultQueryInfo };
+    return (
+      this.queries.get(queryId) || {
+        listeners: [],
+        invalidated: false,
+        document: null,
+        newData: null,
+        lastRequestId: null,
+        observableQuery: null,
+        subscriptions: [],
+      }
+    );
   }
 
   private setQuery(queryId: string, updater: (prev: QueryInfo) => any) {
@@ -1276,6 +1275,7 @@ export class QueryManager<TStore> {
             );
           }
         },
+        clientAwareness: this.clientAwareness,
       },
     };
   }
